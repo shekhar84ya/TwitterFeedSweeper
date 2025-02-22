@@ -7,6 +7,12 @@ class TwitterNavigator {
     this.lastCollectionTime = 0;
     this.debug = true;
 
+    // Reset cache on new session
+    chrome.storage.local.set({ 
+      postCache: [],
+      currentIndex: -1
+    });
+
     // Listen for state changes from background
     chrome.runtime.onMessage.addListener((message) => {
       if (message.type === 'STATE_CHANGED') {
@@ -22,8 +28,8 @@ class TwitterNavigator {
       this.initialize();
     }
 
-    // Set up periodic post collection
-    setInterval(() => this.collectPosts(), 2000);
+    // Set up periodic post collection with more frequent checks
+    setInterval(() => this.collectPosts(), 1000);
 
     // Add mutation observer for dynamic content
     const observer = new MutationObserver(() => {
@@ -50,8 +56,13 @@ class TwitterNavigator {
 
     if (!enabled) {
       this.removeNavigationButtons();
+      // Clear cache when disabled
       this.postCache = [];
       this.currentIndex = -1;
+      await chrome.storage.local.set({ 
+        postCache: [],
+        currentIndex: -1
+      });
     } else {
       await this.initialize();
     }
@@ -69,6 +80,14 @@ class TwitterNavigator {
         return;
       }
 
+      // Reset cache on initialization
+      this.postCache = [];
+      this.currentIndex = -1;
+      await chrome.storage.local.set({ 
+        postCache: [],
+        currentIndex: -1
+      });
+
       // Create navigation UI immediately
       this.createNavigationButtons();
       this.setupKeyboardNavigation();
@@ -77,12 +96,6 @@ class TwitterNavigator {
       // Start collecting posts
       await this.collectPosts();
       this.log('Initial posts collected:', { cacheSize: this.postCache.length });
-
-      // Load cache if needed
-      if (this.postCache.length === 0) {
-        await this.loadCache();
-        this.log('Cache loaded:', { cacheSize: this.postCache.length });
-      }
 
       // Update button states
       this.updateNavigationButtonStates();
@@ -100,15 +113,6 @@ class TwitterNavigator {
     });
   }
 
-  async loadCache() {
-    const result = await chrome.storage.local.get(['postCache', 'currentIndex']);
-    if (result.postCache) {
-      this.postCache = result.postCache;
-      this.currentIndex = result.currentIndex || -1;
-    }
-    this.log('Loaded cache from storage:', { cacheSize: this.postCache.length, currentIndex: this.currentIndex });
-  }
-
   removeNavigationButtons() {
     if (this.navigationButtons) {
       this.navigationButtons.remove();
@@ -120,7 +124,7 @@ class TwitterNavigator {
     if (!this.isEnabled) return;
 
     const now = Date.now();
-    if (now - this.lastCollectionTime < 1000) return;
+    if (now - this.lastCollectionTime < 500) return; // Reduced throttle time
     this.lastCollectionTime = now;
 
     // Try multiple selectors to find tweets, in order of specificity
@@ -210,7 +214,6 @@ class TwitterNavigator {
     const prevButton = this.navigationButtons.querySelector('.prev');
     const nextButton = this.navigationButtons.querySelector('.next');
 
-    // Enable next button if we have posts and either haven't started (-1) or haven't reached the end
     prevButton.disabled = this.currentIndex <= 0;
     nextButton.disabled = this.postCache.length === 0 ||
                          (this.currentIndex >= 0 && this.currentIndex >= this.postCache.length - 1);
@@ -249,10 +252,20 @@ class TwitterNavigator {
       });
     }, { threshold: 0.5 });
 
-    const timeline = document.querySelector('[data-testid="primaryColumn"]');
-    if (timeline) {
-      observer.observe(timeline);
-      this.log('Infinite scroll observer setup on timeline');
+    // Try to find the timeline container
+    const possibleTimelineSelectors = [
+      '[data-testid="primaryColumn"]',
+      'main[role="main"]',
+      '#react-root main'
+    ];
+
+    for (const selector of possibleTimelineSelectors) {
+      const timeline = document.querySelector(selector);
+      if (timeline) {
+        observer.observe(timeline);
+        this.log('Infinite scroll observer setup on timeline:', { selector });
+        break;
+      }
     }
   }
 
