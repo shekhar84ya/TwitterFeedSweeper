@@ -1,40 +1,44 @@
 class TwitterNavigator {
   constructor() {
-    this.postCache = [];
+    this.posts = [];
     this.currentIndex = -1;
     this.isEnabled = true;
     this.navigationButtons = null;
-    this.lastCollectionTime = 0;
     this.debug = true;
-
-    // Reset cache on new session
-    chrome.storage.local.set({ 
-      postCache: [],
-      currentIndex: -1
-    });
 
     // Listen for state changes from background
     chrome.runtime.onMessage.addListener((message) => {
       if (message.type === 'STATE_CHANGED') {
-        this.log('State changed via message:', message);
+        this.log('State changed:', message);
         this.handleStateChange(message.isEnabled);
       }
     });
 
-    // Start initialization after DOM is loaded
+    // Initialize after DOM is ready
     if (document.readyState === 'loading') {
       document.addEventListener('DOMContentLoaded', () => this.initialize());
     } else {
       this.initialize();
     }
 
-    // Set up periodic post collection with more frequent checks
-    setInterval(() => this.collectPosts(), 1000);
-
-    // Add mutation observer for dynamic content
-    const observer = new MutationObserver(() => {
+    // Setup mutation observer for dynamic content with detailed logging
+    const observer = new MutationObserver((mutations) => {
       if (this.isEnabled) {
-        this.collectPosts();
+        const relevantMutations = mutations.filter(m => 
+          m.addedNodes.length > 0 && 
+          Array.from(m.addedNodes).some(node => 
+            node.nodeType === 1 && 
+            (node.matches?.('article') || node.querySelector?.('article'))
+          )
+        );
+
+        if (relevantMutations.length > 0) {
+          this.log('Relevant DOM mutations detected:', {
+            mutationCount: relevantMutations.length,
+            currentPostCount: this.posts.length
+          });
+          this.collectVisiblePosts();
+        }
       }
     });
 
@@ -50,64 +54,54 @@ class TwitterNavigator {
     }
   }
 
-  async handleStateChange(enabled) {
+  handleStateChange(enabled) {
     this.isEnabled = enabled;
     this.log('Handling state change:', { enabled });
 
     if (!enabled) {
       this.removeNavigationButtons();
-      // Clear cache when disabled
-      this.postCache = [];
+      this.posts = [];
       this.currentIndex = -1;
-      await chrome.storage.local.set({ 
-        postCache: [],
-        currentIndex: -1
-      });
     } else {
-      await this.initialize();
+      this.initialize();
     }
   }
 
   async initialize() {
     try {
-      // Get initial state
       const state = await this.getState();
       this.isEnabled = state.isEnabled;
-      this.log('Extension initialized with state:', { isEnabled: this.isEnabled });
+      this.log('Initialized with state:', { isEnabled: this.isEnabled });
 
       if (!this.isEnabled) {
         this.removeNavigationButtons();
         return;
       }
 
-      // Reset cache on initialization
-      this.postCache = [];
+      // Reset navigation state
+      this.posts = [];
       this.currentIndex = -1;
-      await chrome.storage.local.set({ 
-        postCache: [],
-        currentIndex: -1
-      });
 
-      // Create navigation UI immediately
+      // Setup UI and collect initial posts
       this.createNavigationButtons();
       this.setupKeyboardNavigation();
-      this.setupInfiniteScrollObserver();
 
-      // Start collecting posts
-      await this.collectPosts();
-      this.log('Initial posts collected:', { cacheSize: this.postCache.length });
+      // Initial post collection with detailed logging
+      this.log('Starting initial post collection...');
+      await this.collectVisiblePosts();
 
-      // Update button states
-      this.updateNavigationButtonStates();
+      this.log('Initial collection complete:', { 
+        postsFound: this.posts.length,
+        postUrls: this.posts 
+      });
     } catch (error) {
-      this.log('Error during initialization:', error);
+      this.log('Initialization error:', error);
     }
   }
 
   async getState() {
     return new Promise((resolve) => {
       chrome.runtime.sendMessage({ type: 'GET_STATE' }, (response) => {
-        this.log('Got state from background:', response);
         resolve(response || { isEnabled: true });
       });
     });
@@ -120,84 +114,98 @@ class TwitterNavigator {
     }
   }
 
-  async collectPosts() {
+  async collectVisiblePosts() {
     if (!this.isEnabled) return;
 
-    const now = Date.now();
-    if (now - this.lastCollectionTime < 500) return; // Reduced throttle time
-    this.lastCollectionTime = now;
-
-    // Try multiple selectors to find tweets, in order of specificity
+    // Try multiple selectors to find tweets, logging success for each
     const tweetSelectors = [
       'article[data-testid="tweet"]',
       '[data-testid="tweet"]',
-      '[role="article"]',
-      'div[data-testid^="cellInnerDiv"]'
+      'div[data-testid="cellInnerDiv"] article'
     ];
 
-    let tweetElements = [];
+    let tweets = [];
+    let usedSelector = '';
     for (const selector of tweetSelectors) {
       const elements = document.querySelectorAll(selector);
       if (elements.length > 0) {
-        tweetElements = Array.from(elements);
-        this.log('Found tweets using selector:', { selector, count: elements.length });
+        tweets = Array.from(elements);
+        usedSelector = selector;
+        this.log('Found tweets using selector:', { 
+          selector, 
+          count: elements.length 
+        });
         break;
       }
     }
 
-    let newPostsFound = false;
-    let newPostCount = 0;
+    if (tweets.length === 0) {
+      this.log('No tweets found with any selector');
+      return;
+    }
 
-    for (const tweet of tweetElements) {
+    this.log('Processing tweets:', { 
+      usedSelector,
+      totalFound: tweets.length,
+      currentlyCached: this.posts.length 
+    });
+
+    let newPostsFound = false;
+    for (const tweet of tweets) {
       try {
-        // Find links that match tweet status pattern
-        const links = Array.from(tweet.querySelectorAll('a[href*="/status/"]'));
-        const statusLink = links.find(link => {
-          const href = link.href;
-          return href && href.match(/\/status\/\d+/) && !href.includes('/analytics');
+        // Log tweet details for debugging
+        this.log('Processing tweet:', {
+          dataTestId: tweet.getAttribute('data-testid'),
+          role: tweet.getAttribute('role'),
+          class: tweet.className
         });
 
-        if (statusLink && !this.postCache.includes(statusLink.href)) {
-          this.postCache.push(statusLink.href);
-          newPostsFound = true;
-          newPostCount++;
-          this.log('New tweet found:', { href: statusLink.href });
+        // Find all status links in the tweet
+        const links = tweet.querySelectorAll('a[href*="/status/"]');
+        const statusLinks = Array.from(links).filter(link => 
+          link.href && 
+          link.href.match(/\/status\/\d+/) && 
+          !link.href.includes('/analytics')
+        );
+
+        this.log('Found status links:', { 
+          total: links.length,
+          validStatus: statusLinks.length
+        });
+
+        // Add new status links to posts array
+        for (const link of statusLinks) {
+          if (!this.posts.includes(link.href)) {
+            this.posts.push(link.href);
+            newPostsFound = true;
+            this.log('New post found:', { url: link.href });
+          }
         }
       } catch (error) {
         this.log('Error processing tweet:', error);
-        continue;
       }
     }
 
     if (newPostsFound) {
-      try {
-        await chrome.storage.local.set({ postCache: this.postCache });
-        this.log('Cache updated:', { 
-          newPosts: newPostCount, 
-          totalPosts: this.postCache.length,
-          sample: this.postCache.slice(-3) 
-        });
-        this.updateNavigationButtonStates();
-      } catch (error) {
-        this.log('Error updating cache:', error);
-      }
+      this.log('Posts updated:', { 
+        total: this.posts.length,
+        latest: this.posts.slice(-5)  // Show last 5 posts added
+      });
+      this.updateNavigationButtonStates();
     }
   }
 
   createNavigationButtons() {
-    if (!this.isEnabled) return;
-
     this.removeNavigationButtons();
 
     this.navigationButtons = document.createElement('div');
     this.navigationButtons.className = 'twitter-navigator-controls';
     this.navigationButtons.innerHTML = `
-      <button class="nav-button prev" ${this.currentIndex <= 0 ? 'disabled' : ''}>Previous</button>
-      <button class="nav-button next" ${this.postCache.length === 0 ? 'disabled' : ''}>Next</button>
+      <button class="nav-button prev" disabled>Previous</button>
+      <button class="nav-button next" disabled>Next</button>
     `;
 
     document.body.appendChild(this.navigationButtons);
-    this.log('Navigation buttons created');
 
     const prevButton = this.navigationButtons.querySelector('.prev');
     const nextButton = this.navigationButtons.querySelector('.next');
@@ -215,21 +223,20 @@ class TwitterNavigator {
     const nextButton = this.navigationButtons.querySelector('.next');
 
     prevButton.disabled = this.currentIndex <= 0;
-    nextButton.disabled = this.postCache.length === 0 ||
-                         (this.currentIndex >= 0 && this.currentIndex >= this.postCache.length - 1);
+    nextButton.disabled = this.posts.length === 0 || 
+                         (this.currentIndex >= 0 && this.currentIndex >= this.posts.length - 1);
 
-    this.log('Button states updated:', {
+    this.log('Navigation states updated:', {
       prevDisabled: prevButton.disabled,
       nextDisabled: nextButton.disabled,
       currentIndex: this.currentIndex,
-      cacheSize: this.postCache.length
+      totalPosts: this.posts.length
     });
   }
 
   setupKeyboardNavigation() {
     document.addEventListener('keydown', (e) => {
       if (!this.isEnabled) return;
-
       if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
 
       if (e.key === 'ArrowLeft') {
@@ -242,45 +249,19 @@ class TwitterNavigator {
     });
   }
 
-  setupInfiniteScrollObserver() {
-    const observer = new IntersectionObserver((entries) => {
-      entries.forEach(entry => {
-        if (entry.isIntersecting && this.isEnabled) {
-          this.log('Timeline scroll detected, collecting new posts');
-          this.collectPosts();
-        }
-      });
-    }, { threshold: 0.5 });
-
-    // Try to find the timeline container
-    const possibleTimelineSelectors = [
-      '[data-testid="primaryColumn"]',
-      'main[role="main"]',
-      '#react-root main'
-    ];
-
-    for (const selector of possibleTimelineSelectors) {
-      const timeline = document.querySelector(selector);
-      if (timeline) {
-        observer.observe(timeline);
-        this.log('Infinite scroll observer setup on timeline:', { selector });
-        break;
-      }
-    }
-  }
-
   navigate(direction) {
-    if (!this.isEnabled || this.postCache.length === 0) {
-      this.log('Navigation blocked:', { enabled: this.isEnabled, cacheSize: this.postCache.length });
+    if (!this.isEnabled || this.posts.length === 0) {
+      this.log('Navigation blocked:', { 
+        enabled: this.isEnabled, 
+        postsCount: this.posts.length 
+      });
       return;
     }
 
-    const prevIndex = this.currentIndex;
     let targetIndex = this.currentIndex;
 
     if (direction === 'next') {
-      // If we haven't started or are at the end, go to the first post
-      if (this.currentIndex === -1 || this.currentIndex >= this.postCache.length - 1) {
+      if (this.currentIndex === -1 || this.currentIndex >= this.posts.length - 1) {
         targetIndex = 0;
       } else {
         targetIndex = this.currentIndex + 1;
@@ -289,34 +270,21 @@ class TwitterNavigator {
       targetIndex = this.currentIndex - 1;
     }
 
-    // Validate the target URL before navigating
-    if (targetIndex >= 0 && targetIndex < this.postCache.length) {
+    if (targetIndex >= 0 && targetIndex < this.posts.length) {
       this.currentIndex = targetIndex;
+      this.log('Navigating:', {
+        direction,
+        toIndex: this.currentIndex,
+        url: this.posts[this.currentIndex]
+      });
 
-      // Save state before navigation
-      try {
-        chrome.storage.local.set({ currentIndex: this.currentIndex });
-
-        this.log('Navigating:', {
-          direction,
-          fromIndex: prevIndex,
-          toIndex: this.currentIndex,
-          totalPosts: this.postCache.length,
-          url: this.postCache[this.currentIndex]
-        });
-
-        this.updateNavigationButtonStates();
-        window.location.href = this.postCache[this.currentIndex];
-      } catch (error) {
-        this.log('Error during navigation:', error);
-      }
-    } else {
-      this.log('Invalid navigation target:', { targetIndex, cacheSize: this.postCache.length });
+      this.updateNavigationButtonStates();
+      window.location.href = this.posts[this.currentIndex];
     }
   }
 }
 
-// Initialize the navigator when the page is ready
+// Initialize
 if (document.readyState === 'loading') {
   document.addEventListener('DOMContentLoaded', () => new TwitterNavigator());
 } else {
