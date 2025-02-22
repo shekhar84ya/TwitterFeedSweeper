@@ -15,8 +15,27 @@ class TwitterNavigator {
       }
     });
 
-    // Start initialization after a short delay to ensure DOM is ready
-    setTimeout(() => this.initialize(), 1000);
+    // Start initialization after DOM is loaded
+    if (document.readyState === 'loading') {
+      document.addEventListener('DOMContentLoaded', () => this.initialize());
+    } else {
+      this.initialize();
+    }
+
+    // Set up periodic post collection
+    setInterval(() => this.collectPosts(), 2000);
+
+    // Add mutation observer for dynamic content
+    const observer = new MutationObserver(() => {
+      if (this.isEnabled) {
+        this.collectPosts();
+      }
+    });
+
+    observer.observe(document.body, {
+      childList: true,
+      subtree: true
+    });
   }
 
   log(message, data = null) {
@@ -104,25 +123,60 @@ class TwitterNavigator {
     if (now - this.lastCollectionTime < 1000) return;
     this.lastCollectionTime = now;
 
-    const tweetElements = document.querySelectorAll('article[data-testid="tweet"]');
+    // Try multiple selectors to find tweets, in order of specificity
+    const tweetSelectors = [
+      'article[data-testid="tweet"]',
+      '[data-testid="tweet"]',
+      '[role="article"]',
+      'div[data-testid^="cellInnerDiv"]'
+    ];
+
+    let tweetElements = [];
+    for (const selector of tweetSelectors) {
+      const elements = document.querySelectorAll(selector);
+      if (elements.length > 0) {
+        tweetElements = Array.from(elements);
+        this.log('Found tweets using selector:', { selector, count: elements.length });
+        break;
+      }
+    }
+
     let newPostsFound = false;
     let newPostCount = 0;
 
-    tweetElements.forEach(tweet => {
-      const tweetLink = tweet.querySelector('a[href*="/status/"]');
-      if (tweetLink && !this.postCache.includes(tweetLink.href)) {
-        if (tweetLink.href.match(/\/status\/\d+/)) {
-          this.postCache.push(tweetLink.href);
+    for (const tweet of tweetElements) {
+      try {
+        // Find links that match tweet status pattern
+        const links = Array.from(tweet.querySelectorAll('a[href*="/status/"]'));
+        const statusLink = links.find(link => {
+          const href = link.href;
+          return href && href.match(/\/status\/\d+/) && !href.includes('/analytics');
+        });
+
+        if (statusLink && !this.postCache.includes(statusLink.href)) {
+          this.postCache.push(statusLink.href);
           newPostsFound = true;
           newPostCount++;
+          this.log('New tweet found:', { href: statusLink.href });
         }
+      } catch (error) {
+        this.log('Error processing tweet:', error);
+        continue;
       }
-    });
+    }
 
     if (newPostsFound) {
-      await chrome.storage.local.set({ postCache: this.postCache });
-      this.log('New posts collected:', { newPosts: newPostCount, totalPosts: this.postCache.length });
-      this.updateNavigationButtonStates();
+      try {
+        await chrome.storage.local.set({ postCache: this.postCache });
+        this.log('Cache updated:', { 
+          newPosts: newPostCount, 
+          totalPosts: this.postCache.length,
+          sample: this.postCache.slice(-3) 
+        });
+        this.updateNavigationButtonStates();
+      } catch (error) {
+        this.log('Error updating cache:', error);
+      }
     }
   }
 
@@ -135,14 +189,19 @@ class TwitterNavigator {
     this.navigationButtons.className = 'twitter-navigator-controls';
     this.navigationButtons.innerHTML = `
       <button class="nav-button prev" ${this.currentIndex <= 0 ? 'disabled' : ''}>Previous</button>
-      <button class="nav-button next">Next</button>
+      <button class="nav-button next" ${this.postCache.length === 0 ? 'disabled' : ''}>Next</button>
     `;
 
     document.body.appendChild(this.navigationButtons);
     this.log('Navigation buttons created');
 
-    this.navigationButtons.querySelector('.prev').addEventListener('click', () => this.navigate('prev'));
-    this.navigationButtons.querySelector('.next').addEventListener('click', () => this.navigate('next'));
+    const prevButton = this.navigationButtons.querySelector('.prev');
+    const nextButton = this.navigationButtons.querySelector('.next');
+
+    prevButton.addEventListener('click', () => this.navigate('prev'));
+    nextButton.addEventListener('click', () => this.navigate('next'));
+
+    this.updateNavigationButtonStates();
   }
 
   updateNavigationButtonStates() {
@@ -151,8 +210,17 @@ class TwitterNavigator {
     const prevButton = this.navigationButtons.querySelector('.prev');
     const nextButton = this.navigationButtons.querySelector('.next');
 
+    // Enable next button if we have posts and either haven't started (-1) or haven't reached the end
     prevButton.disabled = this.currentIndex <= 0;
-    nextButton.disabled = this.postCache.length === 0;
+    nextButton.disabled = this.postCache.length === 0 ||
+                         (this.currentIndex >= 0 && this.currentIndex >= this.postCache.length - 1);
+
+    this.log('Button states updated:', {
+      prevDisabled: prevButton.disabled,
+      nextDisabled: nextButton.disabled,
+      currentIndex: this.currentIndex,
+      cacheSize: this.postCache.length
+    });
   }
 
   setupKeyboardNavigation() {
@@ -195,28 +263,43 @@ class TwitterNavigator {
     }
 
     const prevIndex = this.currentIndex;
+    let targetIndex = this.currentIndex;
 
-    if (this.currentIndex === -1 || (direction === 'next' && this.currentIndex === this.postCache.length - 1)) {
-      this.currentIndex = 0;
-    } else if (direction === 'next' && this.currentIndex < this.postCache.length - 1) {
-      this.currentIndex++;
+    if (direction === 'next') {
+      // If we haven't started or are at the end, go to the first post
+      if (this.currentIndex === -1 || this.currentIndex >= this.postCache.length - 1) {
+        targetIndex = 0;
+      } else {
+        targetIndex = this.currentIndex + 1;
+      }
     } else if (direction === 'prev' && this.currentIndex > 0) {
-      this.currentIndex--;
-    } else {
-      this.log('Navigation at boundary:', { direction, currentIndex: this.currentIndex });
-      return;
+      targetIndex = this.currentIndex - 1;
     }
 
-    chrome.storage.local.set({ currentIndex: this.currentIndex });
-    this.log('Navigating:', { 
-      direction,
-      fromIndex: prevIndex,
-      toIndex: this.currentIndex,
-      totalPosts: this.postCache.length
-    });
+    // Validate the target URL before navigating
+    if (targetIndex >= 0 && targetIndex < this.postCache.length) {
+      this.currentIndex = targetIndex;
 
-    this.updateNavigationButtonStates();
-    window.location.href = this.postCache[this.currentIndex];
+      // Save state before navigation
+      try {
+        chrome.storage.local.set({ currentIndex: this.currentIndex });
+
+        this.log('Navigating:', {
+          direction,
+          fromIndex: prevIndex,
+          toIndex: this.currentIndex,
+          totalPosts: this.postCache.length,
+          url: this.postCache[this.currentIndex]
+        });
+
+        this.updateNavigationButtonStates();
+        window.location.href = this.postCache[this.currentIndex];
+      } catch (error) {
+        this.log('Error during navigation:', error);
+      }
+    } else {
+      this.log('Invalid navigation target:', { targetIndex, cacheSize: this.postCache.length });
+    }
   }
 }
 
