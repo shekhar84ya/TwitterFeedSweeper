@@ -7,12 +7,33 @@ class TwitterNavigator {
     this.lastCollectionTime = 0;
     this.debug = true; // Enable logging temporarily for debugging
 
+    // Listen for state changes from background
+    chrome.runtime.onMessage.addListener((message) => {
+      if (message.type === 'STATE_CHANGED') {
+        this.log('State changed via message:', message);
+        this.handleStateChange(message.isEnabled);
+      }
+    });
+
     this.initialize();
   }
 
   log(message, data = null) {
     if (this.debug) {
       console.log(`[Twitter Navigator] ${message}`, data || '');
+    }
+  }
+
+  async handleStateChange(enabled) {
+    this.isEnabled = enabled;
+    this.log('Handling state change:', { enabled });
+
+    if (!enabled) {
+      this.removeNavigationButtons();
+      this.postCache = [];
+      this.currentIndex = -1;
+    } else {
+      await this.initialize();
     }
   }
 
@@ -71,6 +92,8 @@ class TwitterNavigator {
   }
 
   async collectPosts() {
+    if (!this.isEnabled) return;
+
     // Throttle collection to avoid excessive DOM operations
     const now = Date.now();
     if (now - this.lastCollectionTime < 1000) return;
@@ -104,6 +127,8 @@ class TwitterNavigator {
   }
 
   createNavigationButtons() {
+    if (!this.isEnabled) return;
+
     this.removeNavigationButtons(); // Remove existing buttons if any
 
     this.navigationButtons = document.createElement('div');
@@ -142,7 +167,7 @@ class TwitterNavigator {
   setupInfiniteScrollObserver() {
     const observer = new IntersectionObserver((entries) => {
       entries.forEach(entry => {
-        if (entry.isIntersecting) {
+        if (entry.isIntersecting && this.isEnabled) {
           this.log('Timeline scroll detected, collecting new posts');
           this.collectPosts();
         }
