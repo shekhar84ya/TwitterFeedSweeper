@@ -11,5 +11,23 @@ name = "Project"
 mode = "parallel"
 author = "agent"
 
+[[workflows.workflow.tasks]]
+task = "workflow.run"
+args = "Chrome Extension"
+
+[[workflows.workflow]]
+name = "Chrome Extension"
+author = "agent"
+
+[workflows.workflow.metadata]
+agentRequireRestartOnSave = false
+
+[[workflows.workflow.tasks]]
+task = "packager.installForAll"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "echo 'Chrome extension development mode enabled' && tail -f /dev/null"
+
 [deployment]
-run = ["sh", "-c", "npx http-server . -p 3000"]
+run = ["sh", "-c", "echo 'Chrome extension development mode enabled' && tail -f /dev/null"]

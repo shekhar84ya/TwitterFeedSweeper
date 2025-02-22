@@ -5,7 +5,7 @@ class TwitterNavigator {
     this.isEnabled = true;
     this.navigationButtons = null;
     this.lastCollectionTime = 0;
-    this.debug = false; // Toggle for debug logging
+    this.debug = true; // Enable logging temporarily for debugging
 
     this.initialize();
   }
@@ -22,47 +22,52 @@ class TwitterNavigator {
     this.isEnabled = state.isEnabled;
     this.log('Extension initialized with state:', { isEnabled: this.isEnabled });
 
-    if (!this.isEnabled) return;
+    if (!this.isEnabled) {
+      this.removeNavigationButtons();
+      return;
+    }
 
-    // Initialize cache
-    await this.loadCache();
-    this.log('Cache loaded:', { cacheSize: this.postCache.length, currentIndex: this.currentIndex });
-
-    // Start post collection
+    // Start collecting posts immediately
     await this.collectPosts();
     this.log('Initial posts collected:', { cacheSize: this.postCache.length });
 
-    // If we have posts and haven't navigated yet, start with the first post
-    if (this.postCache.length > 0 && this.currentIndex === -1) {
-      this.currentIndex = 0;
-      this.log('Auto-navigating to first post:', { url: this.postCache[0] });
-      window.location.href = this.postCache[0];
+    // Initialize cache only if not already set
+    if (this.postCache.length === 0) {
+      await this.loadCache();
+      this.log('Cache loaded:', { cacheSize: this.postCache.length });
     }
 
-    // Add navigation controls
-    this.createNavigationButtons();
-
-    // Setup keyboard listeners
-    this.setupKeyboardNavigation();
-
-    // Setup scroll observer
-    this.setupInfiniteScrollObserver();
+    // Setup navigation only if we have posts
+    if (this.postCache.length > 0) {
+      this.createNavigationButtons();
+      this.setupKeyboardNavigation();
+      this.setupInfiniteScrollObserver();
+    }
   }
 
   async getState() {
     return new Promise((resolve) => {
       chrome.runtime.sendMessage({ type: 'GET_STATE' }, (response) => {
         this.log('Got state from background:', response);
-        resolve(response);
+        resolve(response || { isEnabled: true });
       });
     });
   }
 
   async loadCache() {
     const result = await chrome.storage.local.get(['postCache', 'currentIndex']);
-    this.postCache = result.postCache || [];
-    this.currentIndex = result.currentIndex || -1;
+    if (result.postCache) {
+      this.postCache = result.postCache;
+      this.currentIndex = result.currentIndex || -1;
+    }
     this.log('Loaded cache from storage:', { cacheSize: this.postCache.length, currentIndex: this.currentIndex });
+  }
+
+  removeNavigationButtons() {
+    if (this.navigationButtons) {
+      this.navigationButtons.remove();
+      this.navigationButtons = null;
+    }
   }
 
   async collectPosts() {
@@ -90,17 +95,22 @@ class TwitterNavigator {
     if (newPostsFound) {
       await chrome.storage.local.set({ postCache: this.postCache });
       this.log('New posts collected:', { newPosts: newPostCount, totalPosts: this.postCache.length });
+
+      // If this is our first post and we haven't navigated yet, show the buttons
+      if (this.postCache.length === newPostCount && !this.navigationButtons) {
+        this.createNavigationButtons();
+      }
     }
   }
 
   createNavigationButtons() {
-    if (this.navigationButtons) return;
+    this.removeNavigationButtons(); // Remove existing buttons if any
 
     this.navigationButtons = document.createElement('div');
     this.navigationButtons.className = 'twitter-navigator-controls';
     this.navigationButtons.innerHTML = `
       <button class="nav-button prev" ${this.currentIndex <= 0 ? 'disabled' : ''}>Previous</button>
-      <button class="nav-button next" ${this.currentIndex >= this.postCache.length - 1 ? 'disabled' : ''}>Next</button>
+      <button class="nav-button next">Next</button>
     `;
 
     document.body.appendChild(this.navigationButtons);
@@ -156,7 +166,11 @@ class TwitterNavigator {
     }
 
     const prevIndex = this.currentIndex;
-    if (direction === 'next' && this.currentIndex < this.postCache.length - 1) {
+
+    // For first navigation or 'next', go to first post
+    if (this.currentIndex === -1 || (direction === 'next' && this.currentIndex === this.postCache.length - 1)) {
+      this.currentIndex = 0;
+    } else if (direction === 'next' && this.currentIndex < this.postCache.length - 1) {
       this.currentIndex++;
     } else if (direction === 'prev' && this.currentIndex > 0) {
       this.currentIndex--;
@@ -176,7 +190,7 @@ class TwitterNavigator {
     // Update button states
     if (this.navigationButtons) {
       this.navigationButtons.querySelector('.prev').disabled = this.currentIndex <= 0;
-      this.navigationButtons.querySelector('.next').disabled = this.currentIndex >= this.postCache.length - 1;
+      this.navigationButtons.querySelector('.next').disabled = false; // Always enable next for circular navigation
     }
 
     window.location.href = this.postCache[this.currentIndex];

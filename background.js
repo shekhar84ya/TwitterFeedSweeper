@@ -19,7 +19,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.type === 'GET_STATE') {
     chrome.storage.local.get(['isEnabled'], (result) => {
       log('State requested:', result);
-      sendResponse({ isEnabled: result.isEnabled });
+      sendResponse({ isEnabled: result.isEnabled ?? true });
     });
     return true; // Keep message channel open for async response
   }
@@ -37,7 +37,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       })
     });
 
-    // Only reload if we're on Twitter/X
+    // Only reload if we're on Twitter/X and enabling
     if (request.enabled) {
       chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
         const currentTab = tabs[0];
